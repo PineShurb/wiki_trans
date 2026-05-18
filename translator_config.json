@@ -1,0 +1,16 @@
+{
+  "provider": "local",
+  "local_provider": "ollama",
+  "ollama": {
+    "host": "http://127.0.0.1:11434",
+    "model": "joe-speedboat/Gemma-4-Uncensored-HauhauCS-Aggressive:e4b",
+    "timeout": "20"
+  },
+  "cloud": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4o-mini",
+    "timeout": "20"
+  },
+  "prompt": "翻译为中文"
+}
