@@ -12,5 +12,9 @@
     "model": "gpt-4o-mini",
     "timeout": "20"
   },
-  "prompt": "翻译为中文"
+  "prompt": "翻译为中文",
+  "system": {
+    "font_family": "song ti",
+    "font_size": 12
+  }
 }

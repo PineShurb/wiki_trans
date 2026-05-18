@@ -1,52 +1,29 @@
+import datetime
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox
-import json
 import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+from config_manager import ConfigManager
+from text_utils import parse_timeout, split_text
+from translator_gateway import TranslatorGateway
+from ui_pages import (
+    ModelConfigDialog,
+    open_prompt_config_window,
+    open_reference_config_window,
+    open_system_config_window,
+)
 
 
 class TranslatorUI:
+    def _get_log_file(self) -> str:
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return os.path.join(log_dir, f"trans_{now}.log")
     def _open_system_config_window(self) -> None:
-        if hasattr(self, 'system_config_window') and self.system_config_window is not None and self.system_config_window.winfo_exists():
-            self.system_config_window.focus_set()
-            return
-
-        import tkinter.font as tkfont
-        window = tk.Toplevel(self.root)
-        window.title("系统配置")
-        window.geometry("400x220")
-        window.minsize(320, 180)
-        window.transient(self.root)
-        window.grab_set()
-        self.system_config_window = window
-
-        outer = ttk.Frame(window, padding=16)
-        outer.pack(fill="both", expand=True)
-
-        ttk.Label(outer, text="界面字体:").grid(row=0, column=0, sticky="w", pady=8)
-        font_families = sorted(set(tkfont.families()))
-        font_combo = ttk.Combobox(outer, textvariable=self.font_family_var, values=font_families, state="readonly", width=24)
-        font_combo.grid(row=0, column=1, sticky="w", pady=8)
-
-        ttk.Label(outer, text="字号:").grid(row=1, column=0, sticky="w", pady=8)
-        font_size_spin = ttk.Spinbox(outer, from_=8, to=36, textvariable=self.font_size_var, width=6)
-        font_size_spin.grid(row=1, column=1, sticky="w", pady=8)
-
-        def save_font():
-            family = self.font_family_var.get()
-            size = self.font_size_var.get()
-            self.default_font = (family, int(size))
-            self._apply_font_to_widgets()
-            messagebox.showinfo("提示", f"字体已应用: {family} {size}")
-
-        action_row = ttk.Frame(outer)
-        action_row.grid(row=2, column=0, columnspan=2, pady=(16, 0), sticky="e")
-        ttk.Button(action_row, text="应用", command=save_font).pack(side="right", padx=(0, 8))
-        ttk.Button(action_row, text="关闭", command=window.destroy).pack(side="right")
-
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        open_system_config_window(self)
 
     def _detect_and_set_font(self):
         import tkinter.font as tkfont
@@ -87,10 +64,13 @@ class TranslatorUI:
         self.root.geometry("1000x620")
         self.root.minsize(900, 560)
         self.config_path = Path(__file__).with_name("translator_config.json")
+        self.config_manager = ConfigManager(self.config_path)
 
         self.input_chunks: list[str] = []
         self.current_index = 0
         self.output_buffer: list[str] = []
+        self.current_prompt = ""
+        self.current_reference_text = ""
 
         self.provider_var = tk.StringVar(value="local")
         self.local_provider_var = tk.StringVar(value="ollama")
@@ -127,6 +107,7 @@ class TranslatorUI:
         config_menu = tk.Menu(menu_bar, tearoff=0)
         config_menu.add_command(label="模型配置", command=self._open_model_config_window)
         config_menu.add_command(label="提示词配置", command=self._open_prompt_config_window)
+        config_menu.add_command(label="参考文本配置", command=self._open_reference_config_window)
         config_menu.add_command(label="术语配置", command=self._todo_dialog)
         config_menu.add_command(label="输出配置", command=self._todo_dialog)
         menu_bar.add_cascade(label="配置", menu=config_menu)
@@ -149,49 +130,23 @@ class TranslatorUI:
         self.root.config(menu=menu_bar)
 
     def _open_prompt_config_window(self) -> None:
-        if hasattr(self, 'prompt_config_window') and self.prompt_config_window is not None and self.prompt_config_window.winfo_exists():
-            self.prompt_config_window.focus_set()
-            return
+        open_prompt_config_window(self)
 
-        window = tk.Toplevel(self.root)
-        window.title("提示词配置")
-        window.geometry("600x400")
-        window.minsize(480, 320)
-        window.transient(self.root)
-        window.grab_set()
-        self.prompt_config_window = window
-
-        outer = ttk.Frame(window, padding=12)
-        outer.pack(fill="both", expand=True)
-
-        ttk.Label(outer, text="请输入提示词（Prompt）:").pack(anchor="w", pady=(0, 6))
-        self.prompt_var = tk.StringVar()
-        self.prompt_text_widget = tk.Text(outer, wrap="word", font=self.default_font, height=10)
-        self.prompt_text_widget.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # 加载已有提示词
-        config_data = self._collect_config()
-        prompt_value = config_data.get("prompt", "")
-        self.prompt_text_widget.insert("1.0", prompt_value)
-
-        def save_prompt():
-            value = self.prompt_text_widget.get("1.0", "end-1c").strip()
-            self._save_prompt_to_config(value)
-            messagebox.showinfo("提示", "提示词已保存。")
-
-        action_row = ttk.Frame(outer)
-        action_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(action_row, text="保存", command=save_prompt).pack(side="right", padx=(0, 8))
-        ttk.Button(action_row, text="关闭", command=window.destroy).pack(side="right")
-
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+    def _open_reference_config_window(self) -> None:
+        open_reference_config_window(self)
 
     def _save_prompt_to_config(self, prompt: str) -> None:
         config_data = self._collect_config()
         config_data["prompt"] = prompt
-        self.config_path.write_text(json.dumps(config_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.config_manager.save(config_data)
+
+    def _save_reference_to_config(self, reference_text: str) -> None:
+        config_data = self._collect_config()
+        config_data["reference_text"] = reference_text
+        self.config_manager.save(config_data)
 
     # ...existing code...
+
 
     def _build_main_layout(self) -> None:
         outer = ttk.Frame(self.root, padding=12)
@@ -200,17 +155,37 @@ class TranslatorUI:
         text_panel = ttk.Frame(outer)
         text_panel.pack(fill="both", expand=True)
 
+        # 三栏布局：原文输入、参考文本、翻译结果
+
+        text_panel.grid_rowconfigure(0, weight=1)
+        text_panel.grid_columnconfigure(0, weight=1)
+        text_panel.grid_columnconfigure(1, weight=1)
+        text_panel.grid_columnconfigure(2, weight=1)
+
         left_frame = ttk.LabelFrame(text_panel, text="原文输入")
-        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
+
+        ref_frame = ttk.LabelFrame(text_panel, text="参考文本")
+        ref_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=0)
 
         right_frame = ttk.LabelFrame(text_panel, text="翻译结果")
-        right_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        right_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 0), pady=0)
 
         self.input_text = tk.Text(left_frame, wrap="word", font=self.default_font, undo=True)
         self.input_text.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self.reference_text = tk.Text(ref_frame, wrap="word", font=self.default_font, undo=True)
+        self.reference_text.pack(fill="both", expand=True, padx=8, pady=8)
+
         self.output_text = tk.Text(right_frame, wrap="word", font=self.default_font, state="disabled")
         self.output_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.input_text.bind("<Control-a>", self._select_all_text)
+        self.input_text.bind("<Control-A>", self._select_all_text)
+        self.reference_text.bind("<Control-a>", self._select_all_text)
+        self.reference_text.bind("<Control-A>", self._select_all_text)
+        self.output_text.bind("<Control-a>", self._select_all_text)
+        self.output_text.bind("<Control-A>", self._select_all_text)
 
         control_panel = ttk.Frame(outer)
         control_panel.pack(fill="x", pady=(12, 0))
@@ -232,12 +207,18 @@ class TranslatorUI:
         self.status_label.pack(fill="x", pady=(8, 0))
 
     def start_translation(self) -> None:
+        self._log_file = self._get_log_file()
         raw_text = self.input_text.get("1.0", "end-1c").strip()
         if not raw_text:
             messagebox.showwarning("提示", "请先粘贴待翻译文本。")
             return
 
-        self.input_chunks = self._split_text(raw_text)
+        config_data = self.config_manager.read()
+        self.current_prompt = str(config_data.get("prompt", "")).strip()
+        # 参考文本直接取界面输入
+        self.current_reference_text = self.reference_text.get("1.0", "end-1c").strip()
+
+        self.input_chunks = split_text(raw_text)
         self.current_index = 0
         self.output_buffer = []
         self.progress_var.set(0)
@@ -255,10 +236,14 @@ class TranslatorUI:
             return
 
         chunk = self.input_chunks[self.current_index]
-        translated = self._mock_translate(chunk)
+        try:
+            translated = self._real_translate(chunk)
+        except Exception as e:
+            translated = f"[翻译出错: {e}]"
         self.output_buffer.append(translated)
 
-        self._set_output_text("".join(self.output_buffer))
+
+        self._set_output_text("\n".join(self.output_buffer))
 
         self.current_index += 1
         progress = (self.current_index / len(self.input_chunks)) * 100
@@ -267,125 +252,48 @@ class TranslatorUI:
 
         self.root.after(80, self._translate_step)
 
+    def _real_translate(self, chunk: str) -> str:
+        provider = self.provider_var.get()
+        full_prompt = self._compose_translation_input(chunk)
+        llm_output = ""
+        try:
+            if provider == "local":
+                host = self.ollama_host_var.get()
+                model = self.ollama_model_var.get()
+                timeout = parse_timeout(self.ollama_timeout_var.get())
+                llm_output = TranslatorGateway.translate_ollama(host, model, full_prompt, timeout)
+            else:
+                base_url = self.cloud_base_url_var.get()
+                api_key = self.cloud_api_key_var.get()
+                model = self.cloud_model_var.get()
+                timeout = parse_timeout(self.cloud_timeout_var.get())
+                llm_output = TranslatorGateway.translate_cloud(base_url, api_key, model, full_prompt, timeout)
+        finally:
+            try:
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write("===== PROMPT SENT TO LLM =====\n")
+                    f.write(full_prompt)
+                    f.write("\n\n===== LLM RAW OUTPUT =====\n")
+                    f.write(str(llm_output))
+                    f.write("\n\n===========================\n")
+            except Exception as log_exc:
+                print(f"[Log Write Error]: {log_exc}")
+        return llm_output
+
+    def _compose_translation_input(self, chunk: str) -> str:
+        sections: list[str] = []
+        if self.current_prompt:
+            sections.append(f"【翻译要求】\n{self.current_prompt}")
+        if self.current_reference_text:
+            sections.append(f"【参考文本】\n{self.current_reference_text}")
+        sections.append(f"【待翻译文本】\n{chunk}")
+        return "\n\n".join(sections)
+
     def _open_model_config_window(self) -> None:
-        if self.model_config_window is not None and self.model_config_window.winfo_exists():
-            self.model_config_window.focus_set()
-            return
-
-        window = tk.Toplevel(self.root)
-        window.title("模型配置")
-        window.geometry("700x620")
-        window.minsize(680, 600)
-        window.transient(self.root)
-        window.grab_set()
-
-        self.model_config_window = window
-        self.test_status_var.set("")
-
-        outer = ttk.Frame(window, padding=12)
-        outer.pack(fill="both", expand=True)
-
-        mode_frame = ttk.LabelFrame(outer, text="模型来源")
-        mode_frame.pack(fill="x")
-        ttk.Radiobutton(mode_frame, text="本地模型", value="local", variable=self.provider_var, command=self._refresh_model_provider_ui).pack(side="left", padx=8, pady=8)
-        ttk.Radiobutton(mode_frame, text="云端模型", value="cloud", variable=self.provider_var, command=self._refresh_model_provider_ui).pack(side="left", padx=8, pady=8)
-
-        self.local_frame = ttk.LabelFrame(outer, text="本地模型设置")
-        self.local_frame.pack(fill="x", pady=(10, 0))
-        self._build_local_fields(self.local_frame)
-
-        self.cloud_frame = ttk.LabelFrame(outer, text="云端模型设置")
-        self.cloud_frame.pack(fill="x", pady=(10, 0))
-        self._build_cloud_fields(self.cloud_frame)
-
-        test_frame = ttk.LabelFrame(outer, text="连接测试")
-        test_frame.pack(fill="x", pady=(10, 0))
-
-        self.test_button = ttk.Button(test_frame, text="测试模型是否可用", command=self._start_model_test)
-        self.test_button.pack(anchor="w", padx=8, pady=(8, 4))
-
-        self.status_label_widget = ttk.Label(test_frame, textvariable=self.test_status_var, anchor="w", foreground="#1f2937")
-        self.status_label_widget.pack(fill="x", padx=8, pady=(0, 8))
-
-        tip = (
-            "提示:\n"
-            "1. 本地 Ollama 测试会请求 /api/tags 和 /api/generate。\n"
-            "2. 云端测试会请求 /models 端点验证可用性。"
-        )
-        ttk.Label(test_frame, text=tip, justify="left").pack(anchor="w", padx=8, pady=(0, 8))
-
-        action_row = ttk.Frame(outer)
-        action_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(action_row, text="保存配置", command=self._save_config_by_button).pack(side="right", padx=(0, 8))
-        self.confirm_button = ttk.Button(action_row, text="确认并关闭", command=self._on_model_window_close)
-        self.confirm_button.pack(side="right")
-
-        window.protocol("WM_DELETE_WINDOW", self._on_model_window_close)
-        self._refresh_model_provider_ui()
-
-    def _build_local_fields(self, frame: ttk.LabelFrame) -> None:
-        ttk.Label(frame, text="本地服务").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        local_provider_box = ttk.Combobox(frame, textvariable=self.local_provider_var, values=["ollama"], state="readonly", width=18)
-        local_provider_box.grid(row=0, column=1, sticky="w", padx=8, pady=6)
-
-        ttk.Label(frame, text="Ollama 地址").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.ollama_host_var, width=46).grid(row=1, column=1, sticky="we", padx=8, pady=6)
-
-        ttk.Label(frame, text="模型名称").grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.ollama_model_var, width=46).grid(row=2, column=1, sticky="we", padx=8, pady=6)
-
-        ttk.Label(frame, text="超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.ollama_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=6)
-
-        frame.grid_columnconfigure(1, weight=1)
-
-    def _build_cloud_fields(self, frame: ttk.LabelFrame) -> None:
-        ttk.Label(frame, text="接口地址").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.cloud_base_url_var, width=46).grid(row=0, column=1, sticky="we", padx=8, pady=6)
-
-        ttk.Label(frame, text="API Key").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.cloud_api_key_var, width=46, show="*").grid(row=1, column=1, sticky="we", padx=8, pady=6)
-
-        ttk.Label(frame, text="模型名称").grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.cloud_model_var, width=46).grid(row=2, column=1, sticky="we", padx=8, pady=6)
-
-        ttk.Label(frame, text="超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(frame, textvariable=self.cloud_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=6)
-
-        frame.grid_columnconfigure(1, weight=1)
-
-    def _refresh_model_provider_ui(self) -> None:
-        if self.local_frame is None or self.cloud_frame is None:
-            return
-
-        if self.provider_var.get() == "local":
-            self._set_children_state(self.local_frame, enabled=True)
-            self._set_children_state(self.cloud_frame, enabled=False)
-        else:
-            self._set_children_state(self.local_frame, enabled=False)
-            self._set_children_state(self.cloud_frame, enabled=True)
-
-    def _set_children_state(self, container: tk.Misc, enabled: bool) -> None:
-        target_state = "normal" if enabled else "disabled"
-        readonly_state = "readonly" if enabled else "disabled"
-        for child in container.winfo_children():
-            if isinstance(child, ttk.Combobox):
-                child.configure(state=readonly_state)
-            elif isinstance(child, (ttk.Entry, ttk.Radiobutton, ttk.Button, ttk.Checkbutton)):
-                child.configure(state=target_state)
-            self._set_children_state(child, enabled)
+        ModelConfigDialog(self).open()
 
     def _load_or_create_config(self) -> None:
-        if self.config_path.exists():
-            try:
-                config_data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            except Exception:
-                config_data = self._default_config()
-                self.config_path.write_text(json.dumps(config_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        else:
-            config_data = self._default_config()
-            self.config_path.write_text(json.dumps(config_data, ensure_ascii=False, indent=2), encoding="utf-8")
-
+        config_data = self.config_manager.load_or_create()
         self._apply_config(config_data)
 
     def _bind_config_autosave(self) -> None:
@@ -414,20 +322,18 @@ class TranslatorUI:
 
     def _save_config_file(self) -> None:
         config_data = self._collect_config()
-        self.config_path.write_text(json.dumps(config_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.config_manager.save(config_data)
 
     def _collect_config(self) -> dict:
         # 读取现有配置，保留 prompt 字段
-        if self.config_path.exists():
-            try:
-                config_data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            except Exception:
-                config_data = {}
-        else:
-            config_data = {}
+        config_data = self.config_manager.read()
         config_data.update({
             "provider": self.provider_var.get(),
             "local_provider": self.local_provider_var.get(),
+            "system": {
+                "font_family": self.font_family_var.get(),
+                "font_size": self.font_size_var.get(),
+            },
             "ollama": {
                 "host": self.ollama_host_var.get(),
                 "model": self.ollama_model_var.get(),
@@ -443,13 +349,24 @@ class TranslatorUI:
         return config_data
 
     def _apply_config(self, config_data: dict) -> None:
-        defaults = self._default_config()
+        defaults = self.config_manager.default_config()
         merged = {
             **defaults,
             **config_data,
+            "system": {**defaults["system"], **config_data.get("system", {})},
             "ollama": {**defaults["ollama"], **config_data.get("ollama", {})},
             "cloud": {**defaults["cloud"], **config_data.get("cloud", {})},
         }
+
+        font_family = str(merged["system"].get("font_family", self.default_font[0]))
+        try:
+            font_size = int(merged["system"].get("font_size", self.default_font[1]))
+        except (TypeError, ValueError):
+            font_size = int(self.default_font[1])
+
+        self.font_family_var.set(font_family)
+        self.font_size_var.set(font_size)
+        self.default_font = (font_family, font_size)
 
         self.provider_var.set(str(merged.get("provider", "local")))
         self.local_provider_var.set(str(merged.get("local_provider", "ollama")))
@@ -463,21 +380,7 @@ class TranslatorUI:
 
     @staticmethod
     def _default_config() -> dict:
-        return {
-            "provider": "local",
-            "local_provider": "ollama",
-            "ollama": {
-                "host": "http://127.0.0.1:11434",
-                "model": "qwen2.5:7b",
-                "timeout": "20",
-            },
-            "cloud": {
-                "base_url": "https://api.openai.com/v1",
-                "api_key": "",
-                "model": "gpt-4o-mini",
-                "timeout": "20",
-            },
-        }
+        return ConfigManager.default_config()
 
     def _start_model_test(self) -> None:
         if self.test_button is not None:
@@ -505,98 +408,23 @@ class TranslatorUI:
             self.status_label_widget.config(foreground="#0f5132" if success else "#842029")
 
     def _test_ollama_connection(self) -> str:
-        host = self.ollama_host_var.get().strip().rstrip("/")
-        model = self.ollama_model_var.get().strip()
-        timeout = self._parse_timeout(self.ollama_timeout_var.get())
-
-        if not host:
-            raise ValueError("请填写 Ollama 地址")
-        if not model:
-            raise ValueError("请填写 Ollama 模型名称")
-
-        tags_url = f"{host}/api/tags"
-        tags_req = urllib.request.Request(tags_url, method="GET")
-        with urllib.request.urlopen(tags_req, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"访问 /api/tags 失败，状态码 {resp.status}")
-            body = resp.read().decode("utf-8")
-            tags_data = json.loads(body)
-
-        model_names = [item.get("name", "") for item in tags_data.get("models", [])]
-        if model not in model_names:
-            model_hint = "、".join(model_names[:8]) if model_names else "无"
-            raise RuntimeError(f"本地未发现模型 {model}。当前模型: {model_hint}")
-
-        generate_url = f"{host}/api/generate"
-        payload = json.dumps({"model": model, "prompt": "ping", "stream": False}).encode("utf-8")
-        gen_req = urllib.request.Request(generate_url, data=payload, method="POST")
-        gen_req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(gen_req, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"访问 /api/generate 失败，状态码 {resp.status}")
-            _ = resp.read()
-
-        return f"本地 Ollama 模型可用: {model}"
+        host = self.ollama_host_var.get()
+        model = self.ollama_model_var.get()
+        timeout = parse_timeout(self.ollama_timeout_var.get())
+        return TranslatorGateway.test_ollama_connection(host, model, timeout)
 
     def _test_cloud_connection(self) -> str:
-        base_url = self.cloud_base_url_var.get().strip().rstrip("/")
-        api_key = self.cloud_api_key_var.get().strip()
-        model = self.cloud_model_var.get().strip()
-        timeout = self._parse_timeout(self.cloud_timeout_var.get())
-
-        if not base_url:
-            raise ValueError("请填写云端接口地址")
-        if not api_key:
-            raise ValueError("请填写 API Key")
-        if not model:
-            raise ValueError("请填写云端模型名称")
-
-        models_url = f"{base_url}/models"
-        req = urllib.request.Request(models_url, method="GET")
-        req.add_header("Authorization", f"Bearer {api_key}")
-        req.add_header("Content-Type", "application/json")
-
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"访问 /models 失败，状态码 {resp.status}")
-                body = resp.read().decode("utf-8")
-                data = json.loads(body)
-        except urllib.error.HTTPError as http_err:
-            detail = http_err.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"云端接口错误 {http_err.code}: {detail[:200]}") from http_err
-
-        ids = [item.get("id", "") for item in data.get("data", [])]
-        if model not in ids:
-            top = "、".join(ids[:8]) if ids else "无"
-            return f"连接成功，但模型 {model} 未在列表中。可用模型示例: {top}"
-
-        return f"云端模型可用: {model}"
-
-    @staticmethod
-    def _parse_timeout(raw_text: str) -> float:
-        value = raw_text.strip()
-        if not value:
-            return 20.0
-        timeout = float(value)
-        if timeout <= 0:
-            raise ValueError("超时必须大于 0")
-        return timeout
+        base_url = self.cloud_base_url_var.get()
+        api_key = self.cloud_api_key_var.get()
+        model = self.cloud_model_var.get()
+        timeout = parse_timeout(self.cloud_timeout_var.get())
+        return TranslatorGateway.test_cloud_connection(base_url, api_key, model, timeout)
 
     def _on_model_window_close(self) -> None:
         self._save_config_file()
         if self.model_config_window is not None and self.model_config_window.winfo_exists():
             self.model_config_window.destroy()
         self.model_config_window = None
-
-    @staticmethod
-    def _split_text(text: str, chunk_size: int = 220) -> list[str]:
-        chunks = []
-        start = 0
-        while start < len(text):
-            chunks.append(text[start:start + chunk_size])
-            start += chunk_size
-        return chunks
 
     @staticmethod
     def _mock_translate(chunk: str) -> str:
@@ -608,6 +436,20 @@ class TranslatorUI:
         self.output_text.delete("1.0", "end")
         self.output_text.insert("1.0", content)
         self.output_text.config(state="disabled")
+
+    @staticmethod
+    def _select_all_text(event: tk.Event) -> str:
+        widget = event.widget
+        if isinstance(widget, tk.Text):
+            current_state = widget.cget("state")
+            if current_state == "disabled":
+                widget.config(state="normal")
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+            widget.see("insert")
+            if current_state == "disabled":
+                widget.config(state="disabled")
+        return "break"
 
     @staticmethod
     def _todo_dialog() -> None:
