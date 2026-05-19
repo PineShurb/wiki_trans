@@ -5,7 +5,13 @@ import urllib.request
 
 class TranslatorGateway:
     @staticmethod
-    def translate_ollama(host: str, model: str, text: str, timeout: float) -> str:
+    def _urlopen(request: urllib.request.Request, timeout: float | None = None):
+        if timeout is None:
+            return urllib.request.urlopen(request)
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    @staticmethod
+    def translate_ollama(host: str, model: str, text: str, timeout: float | None = None) -> str:
         """
         调用本地 Ollama API 进行翻译。
         """
@@ -21,7 +27,7 @@ class TranslatorGateway:
         }).encode("utf-8")
         req = urllib.request.Request(url, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with TranslatorGateway._urlopen(req, timeout) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Ollama 生成失败，状态码 {resp.status}")
             body = resp.read().decode("utf-8")
@@ -29,7 +35,7 @@ class TranslatorGateway:
         return data.get("response", "")
 
     @staticmethod
-    def translate_cloud(base_url: str, api_key: str, model: str, text: str, timeout: float) -> str:
+    def translate_cloud(base_url: str, api_key: str, model: str, text: str, timeout: float | None = None) -> str:
         """
         调用云端 API 进行翻译（如OpenAI兼容接口）。
         """
@@ -50,7 +56,7 @@ class TranslatorGateway:
         req = urllib.request.Request(url, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", f"Bearer {api_key}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with TranslatorGateway._urlopen(req, timeout) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"云端生成失败，状态码 {resp.status}")
             body = resp.read().decode("utf-8")

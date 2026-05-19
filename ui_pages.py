@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import filedialog, ttk, messagebox
 
 
 def open_system_config_window(app) -> None:
@@ -83,41 +83,73 @@ def open_prompt_config_window(app) -> None:
     window.protocol("WM_DELETE_WINDOW", window.destroy)
 
 
-def open_reference_config_window(app) -> None:
-    if hasattr(app, "reference_config_window") and app.reference_config_window is not None and app.reference_config_window.winfo_exists():
-        app.reference_config_window.focus_set()
+def open_terminology_config_window(app) -> None:
+    if hasattr(app, "terminology_config_window") and app.terminology_config_window is not None and app.terminology_config_window.winfo_exists():
+        app.terminology_config_window.focus_set()
         return
 
     window = tk.Toplevel(app.root)
-    window.title("参考文本配置")
-    window.geometry("600x400")
-    window.minsize(480, 320)
+    window.title("术语配置")
+    window.geometry("720x260")
+    window.minsize(620, 220)
     window.transient(app.root)
     window.grab_set()
-    app.reference_config_window = window
+    app.terminology_config_window = window
 
     outer = ttk.Frame(window, padding=12)
     outer.pack(fill="both", expand=True)
 
-    ttk.Label(outer, text="请输入参考文本（用于辅助翻译风格/术语）:").pack(anchor="w", pady=(0, 6))
-    app.reference_text_widget = tk.Text(outer, wrap="word", font=app.default_font, height=10)
-    app.reference_text_widget.pack(fill="both", expand=True, padx=4, pady=4)
+    ttk.Label(outer, text="术语表文件路径:").pack(anchor="w", pady=(0, 6))
 
-    config_data = app._collect_config()
-    reference_value = config_data.get("reference_text", "")
-    app.reference_text_widget.insert("1.0", reference_value)
+    tip = (
+        "推荐使用 TSV 文件，每行一条术语，列顺序为: source_term<TAB>target_term<TAB>note\n"
+        "支持单词或词组，翻译时会按当前分块内容匹配命中的术语条目。\n"
+        f"默认模板: {app.terminology_template_path.name}"
+    )
+    ttk.Label(outer, text=tip, justify="left").pack(anchor="w", padx=4, pady=(0, 6))
 
-    def save_reference() -> None:
-        value = app.reference_text_widget.get("1.0", "end-1c").strip()
-        app._save_reference_to_config(value)
-        messagebox.showinfo("提示", "参考文本已保存。")
+    path_row = ttk.Frame(outer)
+    path_row.pack(fill="x", padx=4, pady=(0, 8))
+
+    path_entry = ttk.Entry(path_row, textvariable=app.terminology_path_var)
+    path_entry.pack(side="left", fill="x", expand=True)
+    path_entry.bind("<Control-a>", app._select_all_text)
+    path_entry.bind("<Control-A>", app._select_all_text)
+
+    def browse_terminology_file() -> None:
+        selected_path = filedialog.askopenfilename(
+            title="选择术语表文件",
+            initialdir=str(app.config_path.parent),
+            filetypes=[("TSV 文件", "*.tsv"), ("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if selected_path:
+            app.terminology_path_var.set(selected_path)
+
+    ttk.Button(path_row, text="浏览", command=browse_terminology_file).pack(side="left", padx=(8, 0))
+
+    helper_row = ttk.Frame(outer)
+    helper_row.pack(fill="x", padx=4, pady=(0, 8))
+
+    def use_template_path() -> None:
+        app.terminology_path_var.set(app.terminology_template_path.name)
+
+    ttk.Button(helper_row, text="使用模板路径", command=use_template_path).pack(side="left")
+
+    def save_terminology() -> None:
+        value = app.terminology_path_var.get().strip()
+        app._save_terminology_to_config(value)
+        messagebox.showinfo("提示", "术语配置已保存。")
+
+    def close_window() -> None:
+        app.terminology_config_window = None
+        window.destroy()
 
     action_row = ttk.Frame(outer)
     action_row.pack(fill="x", pady=(10, 0))
-    ttk.Button(action_row, text="保存", command=save_reference).pack(side="right", padx=(0, 8))
-    ttk.Button(action_row, text="关闭", command=window.destroy).pack(side="right")
+    ttk.Button(action_row, text="保存", command=save_terminology).pack(side="right", padx=(0, 8))
+    ttk.Button(action_row, text="关闭", command=close_window).pack(side="right")
 
-    window.protocol("WM_DELETE_WINDOW", window.destroy)
+    window.protocol("WM_DELETE_WINDOW", close_window)
 
 
 class ModelConfigDialog:

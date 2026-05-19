@@ -1,0 +1,9 @@
+# 术语表模板（TSV）
+# 每行一条术语，列顺序：source_term<TAB>target_term<TAB>note
+# 支持单词和词组；以 # 开头的行为注释。
+source_term	target_term	note
+CPU	中央处理器	硬件术语，全文统一
+machine learning	机器学习	固定译法，避免翻成“机器学习方法”
+knowledge base	知识库	不要翻成“知识基础”
+infobox	信息框	维基页面元素
+sandbox environment	沙盒环境	优先保留技术语义

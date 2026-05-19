@@ -1,3 +1,4 @@
+import csv
 import datetime
 import os
 import tkinter as tk
@@ -6,13 +7,13 @@ import threading
 from pathlib import Path
 
 from config_manager import ConfigManager
-from text_utils import parse_timeout, split_text
+from text_utils import parse_timeout
 from translator_gateway import TranslatorGateway
 from ui_pages import (
     ModelConfigDialog,
     open_prompt_config_window,
-    open_reference_config_window,
     open_system_config_window,
+    open_terminology_config_window,
 )
 
 
@@ -50,13 +51,21 @@ class TranslatorUI:
             self.default_font = ("Arial", 12)
 
     def _apply_font_to_widgets(self):
-        # 只对主要 Text 控件和提示词配置 Text 应用字体
-        if hasattr(self, "input_text"):
-            self.input_text.config(font=self.default_font)
-        if hasattr(self, "output_text"):
-            self.output_text.config(font=self.default_font)
-        if hasattr(self, "prompt_text_widget"):
-            self.prompt_text_widget.config(font=self.default_font)
+        widget_names = [
+            "input_text",
+            "reference_text",
+            "output_text",
+            "prompt_text_widget",
+        ]
+        for widget_name in widget_names:
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            try:
+                if widget.winfo_exists():
+                    widget.config(font=self.default_font)
+            except tk.TclError:
+                continue
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -64,12 +73,15 @@ class TranslatorUI:
         self.root.geometry("1000x620")
         self.root.minsize(900, 560)
         self.config_path = Path(__file__).with_name("translator_config.json")
+        self.terminology_template_path = self.config_path.with_name("terminology_template.tsv")
         self.config_manager = ConfigManager(self.config_path)
 
         self.input_chunks: list[str] = []
         self.current_index = 0
         self.output_buffer: list[str] = []
         self.current_prompt = ""
+        self.current_terminology_path = ""
+        self.current_terminology_entries: list[dict[str, str]] = []
         self.current_reference_text = ""
 
         self.provider_var = tk.StringVar(value="local")
@@ -82,6 +94,7 @@ class TranslatorUI:
         self.cloud_api_key_var = tk.StringVar(value="")
         self.cloud_model_var = tk.StringVar(value="gpt-4o-mini")
         self.cloud_timeout_var = tk.StringVar(value="20")
+        self.terminology_path_var = tk.StringVar(value="")
         self.test_status_var = tk.StringVar(value="")
 
         self.model_config_window: tk.Toplevel | None = None
@@ -107,8 +120,7 @@ class TranslatorUI:
         config_menu = tk.Menu(menu_bar, tearoff=0)
         config_menu.add_command(label="模型配置", command=self._open_model_config_window)
         config_menu.add_command(label="提示词配置", command=self._open_prompt_config_window)
-        config_menu.add_command(label="参考文本配置", command=self._open_reference_config_window)
-        config_menu.add_command(label="术语配置", command=self._todo_dialog)
+        config_menu.add_command(label="术语配置", command=self._open_terminology_config_window)
         config_menu.add_command(label="输出配置", command=self._todo_dialog)
         menu_bar.add_cascade(label="配置", menu=config_menu)
 
@@ -132,18 +144,33 @@ class TranslatorUI:
     def _open_prompt_config_window(self) -> None:
         open_prompt_config_window(self)
 
-    def _open_reference_config_window(self) -> None:
-        open_reference_config_window(self)
+    def _open_terminology_config_window(self) -> None:
+        open_terminology_config_window(self)
 
     def _save_prompt_to_config(self, prompt: str) -> None:
         config_data = self._collect_config()
         config_data["prompt"] = prompt
         self.config_manager.save(config_data)
 
-    def _save_reference_to_config(self, reference_text: str) -> None:
+    def _save_terminology_to_config(self, terminology_path: str) -> None:
         config_data = self._collect_config()
-        config_data["reference_text"] = reference_text
+        config_data["terminology_path"] = terminology_path.strip()
+        config_data.pop("terminology", None)
         self.config_manager.save(config_data)
+
+    def _create_scrollable_text(self, parent: ttk.LabelFrame, **text_options) -> tk.Text:
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True, padx=8, pady=8)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        text_widget = tk.Text(container, **text_options)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=text_widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        return text_widget
 
     # ...existing code...
 
@@ -171,14 +198,26 @@ class TranslatorUI:
         right_frame = ttk.LabelFrame(text_panel, text="翻译结果")
         right_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 0), pady=0)
 
-        self.input_text = tk.Text(left_frame, wrap="word", font=self.default_font, undo=True)
-        self.input_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.input_text = self._create_scrollable_text(
+            left_frame,
+            wrap="word",
+            font=self.default_font,
+            undo=True,
+        )
 
-        self.reference_text = tk.Text(ref_frame, wrap="word", font=self.default_font, undo=True)
-        self.reference_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.reference_text = self._create_scrollable_text(
+            ref_frame,
+            wrap="word",
+            font=self.default_font,
+            undo=True,
+        )
 
-        self.output_text = tk.Text(right_frame, wrap="word", font=self.default_font, state="disabled")
-        self.output_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.output_text = self._create_scrollable_text(
+            right_frame,
+            wrap="word",
+            font=self.default_font,
+            state="disabled",
+        )
 
         self.input_text.bind("<Control-a>", self._select_all_text)
         self.input_text.bind("<Control-A>", self._select_all_text)
@@ -213,12 +252,22 @@ class TranslatorUI:
             messagebox.showwarning("提示", "请先粘贴待翻译文本。")
             return
 
-        config_data = self.config_manager.read()
+        config_data = self.config_manager.read_merged()
         self.current_prompt = str(config_data.get("prompt", "")).strip()
+        self.current_terminology_path = str(config_data.get("terminology_path", "")).strip()
+        self.current_terminology_entries = []
+        if self.current_terminology_path:
+            try:
+                self.current_terminology_entries = self._load_terminology_entries(self.current_terminology_path)
+            except FileNotFoundError:
+                self.current_terminology_entries = []
+            except (OSError, ValueError) as exc:
+                messagebox.showwarning("提示", f"术语表加载失败: {exc}")
+                return
         # 参考文本直接取界面输入
         self.current_reference_text = self.reference_text.get("1.0", "end-1c").strip()
 
-        self.input_chunks = split_text(raw_text)
+        self.input_chunks = [raw_text]
         self.current_index = 0
         self.output_buffer = []
         self.progress_var.set(0)
@@ -260,14 +309,12 @@ class TranslatorUI:
             if provider == "local":
                 host = self.ollama_host_var.get()
                 model = self.ollama_model_var.get()
-                timeout = parse_timeout(self.ollama_timeout_var.get())
-                llm_output = TranslatorGateway.translate_ollama(host, model, full_prompt, timeout)
+                llm_output = TranslatorGateway.translate_ollama(host, model, full_prompt)
             else:
                 base_url = self.cloud_base_url_var.get()
                 api_key = self.cloud_api_key_var.get()
                 model = self.cloud_model_var.get()
-                timeout = parse_timeout(self.cloud_timeout_var.get())
-                llm_output = TranslatorGateway.translate_cloud(base_url, api_key, model, full_prompt, timeout)
+                llm_output = TranslatorGateway.translate_cloud(base_url, api_key, model, full_prompt)
         finally:
             try:
                 with open(self._log_file, "a", encoding="utf-8") as f:
@@ -284,10 +331,83 @@ class TranslatorUI:
         sections: list[str] = []
         if self.current_prompt:
             sections.append(f"【翻译要求】\n{self.current_prompt}")
+        terminology_block = self._build_terminology_block(chunk)
+        if terminology_block:
+            sections.append(f"【术语要求】\n{terminology_block}")
         if self.current_reference_text:
             sections.append(f"【参考文本】\n{self.current_reference_text}")
         sections.append(f"【待翻译文本】\n{chunk}")
         return "\n\n".join(sections)
+
+    def _build_terminology_block(self, chunk: str) -> str:
+        if not self.current_terminology_entries:
+            return ""
+
+        chunk_text = chunk.casefold()
+        matched_entries = [
+            entry for entry in self.current_terminology_entries if entry["source"].casefold() in chunk_text
+        ]
+        if not matched_entries:
+            return ""
+
+        matched_entries.sort(key=lambda entry: len(entry["source"]), reverse=True)
+        lines = ["请优先使用以下术语对照:"]
+        for entry in matched_entries:
+            item = f"- {entry['source']} -> {entry['target']}"
+            if entry["note"]:
+                item += f" ({entry['note']})"
+            lines.append(item)
+        return "\n".join(lines)
+
+    def _load_terminology_entries(self, terminology_path: str) -> list[dict[str, str]]:
+        normalized_path = terminology_path.strip()
+        if not normalized_path:
+            return []
+
+        glossary_path = self._resolve_terminology_path(normalized_path)
+        if not glossary_path.exists():
+            raise FileNotFoundError(f"未找到术语表文件: {glossary_path}")
+        if not glossary_path.is_file():
+            raise ValueError(f"术语表路径不是文件: {glossary_path}")
+
+        entries: list[dict[str, str]] = []
+        with glossary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            for line_number, row in enumerate(reader, start=1):
+                normalized_row = [column.strip() for column in row]
+                if not normalized_row or not any(normalized_row):
+                    continue
+                if normalized_row[0].startswith("#"):
+                    continue
+                if self._is_terminology_header(normalized_row):
+                    continue
+                if len(normalized_row) < 2 or not normalized_row[0] or not normalized_row[1]:
+                    raise ValueError(
+                        f"{glossary_path.name} 第 {line_number} 行格式无效，应为 source_term[TAB]target_term[TAB]note"
+                    )
+
+                entries.append({
+                    "source": normalized_row[0],
+                    "target": normalized_row[1],
+                    "note": normalized_row[2] if len(normalized_row) > 2 else "",
+                })
+        return entries
+
+    def _resolve_terminology_path(self, terminology_path: str) -> Path:
+        candidate = Path(terminology_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.config_path.parent / candidate
+        return candidate
+
+    @staticmethod
+    def _is_terminology_header(row: list[str]) -> bool:
+        if len(row) < 2:
+            return False
+        first_column = row[0].casefold()
+        second_column = row[1].casefold()
+        source_markers = {"source", "source_term", "term", "source phrase"}
+        target_markers = {"target", "target_term", "translation", "target phrase"}
+        return first_column in source_markers and second_column in target_markers
 
     def _open_model_config_window(self) -> None:
         ModelConfigDialog(self).open()
@@ -325,8 +445,8 @@ class TranslatorUI:
         self.config_manager.save(config_data)
 
     def _collect_config(self) -> dict:
-        # 读取现有配置，保留 prompt 字段
-        config_data = self.config_manager.read()
+        # 读取现有配置，保留 prompt 等非表单字段，并补齐默认值
+        config_data = self.config_manager.read_merged()
         config_data.update({
             "provider": self.provider_var.get(),
             "local_provider": self.local_provider_var.get(),
@@ -345,7 +465,9 @@ class TranslatorUI:
                 "model": self.cloud_model_var.get(),
                 "timeout": self.cloud_timeout_var.get(),
             },
+            "terminology_path": self.terminology_path_var.get().strip(),
         })
+        config_data.pop("terminology", None)
         return config_data
 
     def _apply_config(self, config_data: dict) -> None:
@@ -377,6 +499,7 @@ class TranslatorUI:
         self.cloud_api_key_var.set(str(merged["cloud"].get("api_key", "")))
         self.cloud_model_var.set(str(merged["cloud"].get("model", "gpt-4o-mini")))
         self.cloud_timeout_var.set(str(merged["cloud"].get("timeout", "20")))
+        self.terminology_path_var.set(str(merged.get("terminology_path", "")).strip())
 
     @staticmethod
     def _default_config() -> dict:
@@ -449,6 +572,9 @@ class TranslatorUI:
             widget.see("insert")
             if current_state == "disabled":
                 widget.config(state="disabled")
+        elif isinstance(widget, (tk.Entry, ttk.Entry)):
+            widget.selection_range(0, "end")
+            widget.icursor(0)
         return "break"
 
     @staticmethod
