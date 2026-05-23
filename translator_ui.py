@@ -1,5 +1,6 @@
 import csv
 import datetime
+from difflib import SequenceMatcher
 import os
 import time
 import tkinter as tk
@@ -94,6 +95,7 @@ class TranslatorUI:
         self.current_index = 0
         self.output_buffer: list[str] = []
         self.active_chunk_text = ""
+        self.completed_output_text = ""
         self.current_prompt = ""
         self.current_terminology_path = ""
         self.current_terminology_entries: list[dict[str, str]] = []
@@ -103,6 +105,7 @@ class TranslatorUI:
         self.translation_status_job: str | None = None
         self.translation_status_tick = 0
         self.translation_error_count = 0
+        self.diff_mode_enabled = False
 
         self.provider_var = tk.StringVar(value="local")
         self.local_provider_var = tk.StringVar(value="ollama")
@@ -116,6 +119,7 @@ class TranslatorUI:
         self.cloud_timeout_var = tk.StringVar(value="20")
         self.terminology_path_var = tk.StringVar(value="")
         self.test_status_var = tk.StringVar(value="")
+        self.diff_toggle_text_var = tk.StringVar(value="显示差异")
 
         self.model_config_window: tk.Toplevel | None = None
         self.local_frame: ttk.Frame | None = None
@@ -123,6 +127,7 @@ class TranslatorUI:
         self.test_button: ttk.Button | None = None
         self.inference_test_button: ttk.Button | None = None
         self.confirm_button: ttk.Button | None = None
+        self.diff_toggle_button: ttk.Button | None = None
         self.status_label_widget: ttk.Label | None = None
         self._config_ready = False
 
@@ -239,6 +244,7 @@ class TranslatorUI:
             font=self.default_font,
             state="disabled",
         )
+        self._configure_diff_tags()
 
         self.input_text.bind("<Control-a>", self._select_all_text)
         self.input_text.bind("<Control-A>", self._select_all_text)
@@ -252,6 +258,14 @@ class TranslatorUI:
 
         self.start_button = ttk.Button(control_panel, text="开始翻译", command=self.start_translation)
         self.start_button.pack(side="left")
+
+        self.diff_toggle_button = ttk.Button(
+            control_panel,
+            textvariable=self.diff_toggle_text_var,
+            command=self._toggle_diff_display,
+            state="disabled",
+        )
+        self.diff_toggle_button.pack(side="left", padx=(8, 0))
 
         self.progress_var = tk.DoubleVar(value=0)
         self.progress = ttk.Progressbar(
@@ -294,6 +308,7 @@ class TranslatorUI:
             messagebox.showwarning("提示", f"翻译配置无效: {exc}")
             return
 
+        self._reset_completed_translation_state()
         self.input_chunks = [raw_text]
         self.current_index = 0
         self.output_buffer = []
@@ -356,9 +371,12 @@ class TranslatorUI:
 
         if self.current_index >= len(self.input_chunks):
             self._stop_translation_feedback()
+            self.completed_output_text = "\n".join(self.output_buffer)
             self.start_button.config(state="normal")
             self.progress.configure(mode="determinate")
             self.progress_var.set(100 if self.translation_error_count == 0 else 0)
+            self._set_diff_toggle_enabled(bool(self.completed_output_text or self.current_reference_text))
+            self._refresh_diff_display()
             if self.translation_error_count:
                 self.status_var.set(f"翻译结束，含 {self.translation_error_count} 个错误")
             else:
@@ -772,6 +790,61 @@ class TranslatorUI:
         # 预留真实翻译调用位置：后续可替换为本地LLM接口。
         return chunk
 
+    def _configure_diff_tags(self) -> None:
+        self.reference_text.tag_configure("diff_missing", foreground="#b42318")
+        self.output_text.tag_configure("diff_added", foreground="#067647")
+
+    def _clear_diff_tags(self) -> None:
+        self.reference_text.tag_remove("diff_missing", "1.0", "end")
+        self.output_text.tag_remove("diff_added", "1.0", "end")
+
+    def _set_diff_toggle_enabled(self, enabled: bool) -> None:
+        if self.diff_toggle_button is None:
+            return
+        self.diff_toggle_button.config(state="normal" if enabled else "disabled")
+        if not enabled:
+            self.diff_mode_enabled = False
+            self.diff_toggle_text_var.set("显示差异")
+
+    def _reset_completed_translation_state(self) -> None:
+        self.completed_output_text = ""
+        self.diff_mode_enabled = False
+        self.diff_toggle_text_var.set("显示差异")
+        self._clear_diff_tags()
+        self._set_diff_toggle_enabled(False)
+
+    def _toggle_diff_display(self) -> None:
+        if not self.completed_output_text and not self.current_reference_text:
+            return
+        self.diff_mode_enabled = not self.diff_mode_enabled
+        self.diff_toggle_text_var.set("隐藏差异" if self.diff_mode_enabled else "显示差异")
+        self._refresh_diff_display()
+
+    def _refresh_diff_display(self) -> None:
+        self._clear_diff_tags()
+        if self.completed_output_text and self.output_text.get("1.0", "end-1c") != self.completed_output_text:
+            self._set_output_text(self.completed_output_text)
+
+        if not self.diff_mode_enabled:
+            return
+
+        reference_content = self.reference_text.get("1.0", "end-1c")
+        output_content = self.completed_output_text
+        matcher = SequenceMatcher(None, reference_content, output_content, autojunk=False)
+        for opcode, ref_start, ref_end, out_start, out_end in matcher.get_opcodes():
+            if opcode in {"delete", "replace"} and ref_start != ref_end:
+                self.reference_text.tag_add(
+                    "diff_missing",
+                    f"1.0 + {ref_start} chars",
+                    f"1.0 + {ref_end} chars",
+                )
+            if opcode in {"insert", "replace"} and out_start != out_end:
+                self.output_text.tag_add(
+                    "diff_added",
+                    f"1.0 + {out_start} chars",
+                    f"1.0 + {out_end} chars",
+                )
+
     def _set_output_text(self, content: str) -> None:
         self.output_text.config(state="normal")
         self.output_text.delete("1.0", "end")
@@ -804,6 +877,7 @@ class TranslatorUI:
         self.input_text.delete("1.0", "end")
 
     def _clear_output(self) -> None:
+        self._reset_completed_translation_state()
         self._set_output_text("")
 
     def _clear_all(self) -> None:
