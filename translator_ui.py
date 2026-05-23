@@ -1,10 +1,13 @@
 import csv
 import datetime
 import os
+import time
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import ttk, messagebox
 import threading
 from pathlib import Path
+from typing import TypedDict
 
 from config_manager import ConfigManager
 from text_utils import parse_timeout
@@ -15,6 +18,17 @@ from ui_pages import (
     open_system_config_window,
     open_terminology_config_window,
 )
+
+
+class TranslationRuntimeConfig(TypedDict):
+    provider: str
+    ollama_host: str
+    ollama_model: str
+    ollama_timeout: float | None
+    cloud_base_url: str
+    cloud_api_key: str
+    cloud_model: str
+    cloud_timeout: float | None
 
 
 class TranslatorUI:
@@ -79,10 +93,16 @@ class TranslatorUI:
         self.input_chunks: list[str] = []
         self.current_index = 0
         self.output_buffer: list[str] = []
+        self.active_chunk_text = ""
         self.current_prompt = ""
         self.current_terminology_path = ""
         self.current_terminology_entries: list[dict[str, str]] = []
         self.current_reference_text = ""
+        self.current_runtime_config: TranslationRuntimeConfig | None = None
+        self.translation_started_at: float | None = None
+        self.translation_status_job: str | None = None
+        self.translation_status_tick = 0
+        self.translation_error_count = 0
 
         self.provider_var = tk.StringVar(value="local")
         self.local_provider_var = tk.StringVar(value="ollama")
@@ -101,6 +121,7 @@ class TranslatorUI:
         self.local_frame: ttk.Frame | None = None
         self.cloud_frame: ttk.Frame | None = None
         self.test_button: ttk.Button | None = None
+        self.inference_test_button: ttk.Button | None = None
         self.confirm_button: ttk.Button | None = None
         self.status_label_widget: ttk.Label | None = None
         self._config_ready = False
@@ -267,11 +288,22 @@ class TranslatorUI:
         # 参考文本直接取界面输入
         self.current_reference_text = self.reference_text.get("1.0", "end-1c").strip()
 
+        try:
+            self.current_runtime_config = self._collect_runtime_config()
+        except ValueError as exc:
+            messagebox.showwarning("提示", f"翻译配置无效: {exc}")
+            return
+
         self.input_chunks = [raw_text]
         self.current_index = 0
         self.output_buffer = []
+        self.active_chunk_text = ""
+        self.translation_started_at = time.monotonic()
+        self.translation_status_tick = 0
+        self.translation_error_count = 0
         self.progress_var.set(0)
-        self._set_output_text("")
+        self._set_output_text(self._build_waiting_output_hint())
+        self._start_translation_feedback()
 
         self.start_button.config(state="disabled")
         self.status_var.set("翻译中...")
@@ -285,39 +317,190 @@ class TranslatorUI:
             return
 
         chunk = self.input_chunks[self.current_index]
+        self.active_chunk_text = ""
+        self.status_var.set(f"翻译中... {self.current_index + 1}/{len(self.input_chunks)}")
+        threading.Thread(target=self._translate_current_chunk, args=(chunk,), daemon=True).start()
+
+    def _translate_current_chunk(self, chunk: str) -> None:
+        error_message = None
         try:
-            translated = self._real_translate(chunk)
-        except Exception as e:
-            translated = f"[翻译出错: {e}]"
+            translated = self._real_translate(chunk, self._schedule_stream_chunk)
+        except Exception as exc:
+            translated = self._format_translation_error(chunk, exc)
+            error_message = str(exc).strip() or exc.__class__.__name__
+
+        self.root.after(0, self._finish_translate_chunk, translated, error_message)
+
+    def _schedule_stream_chunk(self, chunk: str) -> None:
+        self.root.after(0, self._append_stream_output, chunk)
+
+    def _append_stream_output(self, chunk: str) -> None:
+        self.active_chunk_text += chunk
+        display_parts = self.output_buffer.copy()
+        if self.active_chunk_text:
+            display_parts.append(self.active_chunk_text)
+        self._set_output_text("\n".join(display_parts))
+
+    def _finish_translate_chunk(self, translated: str, error_message: str | None = None) -> None:
         self.output_buffer.append(translated)
-
-
+        self.active_chunk_text = ""
         self._set_output_text("\n".join(self.output_buffer))
 
-        self.current_index += 1
-        progress = (self.current_index / len(self.input_chunks)) * 100
-        self.progress_var.set(progress)
-        self.status_var.set(f"翻译中... {self.current_index}/{len(self.input_chunks)}")
+        if error_message:
+            self.translation_error_count += 1
 
+        self.current_index += 1
+        if self.progress.cget("mode") == "determinate":
+            progress = (self.current_index / len(self.input_chunks)) * 100
+            self.progress_var.set(progress)
+
+        if self.current_index >= len(self.input_chunks):
+            self._stop_translation_feedback()
+            self.start_button.config(state="normal")
+            self.progress.configure(mode="determinate")
+            self.progress_var.set(100 if self.translation_error_count == 0 else 0)
+            if self.translation_error_count:
+                self.status_var.set(f"翻译结束，含 {self.translation_error_count} 个错误")
+            else:
+                self.status_var.set("翻译完成")
+            return
+
+        self.status_var.set(f"翻译中... {self.current_index}/{len(self.input_chunks)}")
         self.root.after(80, self._translate_step)
 
-    def _real_translate(self, chunk: str) -> str:
-        provider = self.provider_var.get()
+    def _build_waiting_output_hint(self) -> str:
+        runtime_config = self.current_runtime_config or {}
+        provider = str(runtime_config.get("provider", ""))
+        if provider == "local":
+            model = str(runtime_config.get("ollama_model", "")).strip()
+            timeout = runtime_config.get("ollama_timeout")
+        else:
+            model = str(runtime_config.get("cloud_model", "")).strip()
+            timeout = runtime_config.get("cloud_timeout")
+
+        timeout_text = "不限时" if timeout is None else f"{timeout:g} 秒"
+        parts = ["[系统运行中] 已发送完整请求，正在等待模型返回首个输出片段。"]
+        if model:
+            parts.append(f"当前模型: {model}。")
+        parts.append(f"超时设置: {timeout_text}。")
+        parts.append("长文本或首次加载模型时，等待时间可能较长。")
+        return " ".join(parts)
+
+    def _start_translation_feedback(self) -> None:
+        self._stop_translation_feedback()
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(10)
+        self._schedule_translation_feedback()
+
+    def _stop_translation_feedback(self) -> None:
+        if self.translation_status_job is not None:
+            self.root.after_cancel(self.translation_status_job)
+            self.translation_status_job = None
+        self.progress.stop()
+
+    def _schedule_translation_feedback(self) -> None:
+        total_chunks = len(self.input_chunks)
+        if total_chunks == 0:
+            return
+
+        chunk_label = f"{min(self.current_index + 1, total_chunks)}/{total_chunks}"
+        elapsed = 0.0 if self.translation_started_at is None else time.monotonic() - self.translation_started_at
+        dots = "." * ((self.translation_status_tick % 3) + 1)
+        phase = "等待模型响应" if not self.active_chunk_text else "正在接收输出"
+        self.status_var.set(f"翻译中{dots} 第 {chunk_label} 段，{phase}，已运行 {elapsed:.0f} 秒")
+        self.translation_status_tick += 1
+        self.translation_status_job = self.root.after(700, self._schedule_translation_feedback)
+
+    @staticmethod
+    def _is_timeout_exception(exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        message = str(exc).casefold()
+        return "timed out" in message or "请求超时" in message
+
+    def _format_translation_error(self, chunk: str, exc: Exception) -> str:
+        message = str(exc).strip() or exc.__class__.__name__
+        if not self._is_timeout_exception(exc):
+            return f"[翻译出错: {message}]"
+
+        runtime_config = self.current_runtime_config or {}
+        provider = str(runtime_config.get("provider", ""))
+        if provider == "local":
+            model = str(runtime_config.get("ollama_model", "")).strip()
+            timeout = runtime_config.get("ollama_timeout")
+        else:
+            model = str(runtime_config.get("cloud_model", "")).strip()
+            timeout = runtime_config.get("cloud_timeout")
+
+        metadata = [f"当前请求约 {len(self._compose_translation_input(chunk))} 字符"]
+        if model:
+            metadata.append(f"模型 {model}")
+        if isinstance(timeout, (int, float)):
+            metadata.append(f"超时设置 {timeout:g} 秒")
+        else:
+            metadata.append("超时设置 不限时")
+
+        return (
+            f"[翻译超时: {message} {'，'.join(metadata)}。"
+            "请缩短待翻译/参考文本、提高超时，或改用更快的模型。]"
+        )
+
+    def _real_translate(self, chunk: str, on_chunk: Callable[[str], None] | None = None) -> str:
+        runtime_config = self.current_runtime_config
+        if runtime_config is None:
+            raise RuntimeError("翻译配置未初始化")
+
+        provider = runtime_config["provider"]
         full_prompt = self._compose_translation_input(chunk)
         llm_output = ""
+        request_error: Exception | None = None
         try:
             if provider == "local":
-                host = self.ollama_host_var.get()
-                model = self.ollama_model_var.get()
-                llm_output = TranslatorGateway.translate_ollama(host, model, full_prompt)
+                if on_chunk is None:
+                    llm_output = TranslatorGateway.translate_ollama(
+                        runtime_config["ollama_host"],
+                        runtime_config["ollama_model"],
+                        full_prompt,
+                        runtime_config["ollama_timeout"],
+                    )
+                else:
+                    llm_output = TranslatorGateway.translate_ollama_stream(
+                        runtime_config["ollama_host"],
+                        runtime_config["ollama_model"],
+                        full_prompt,
+                        on_chunk,
+                        runtime_config["ollama_timeout"],
+                    )
             else:
-                base_url = self.cloud_base_url_var.get()
-                api_key = self.cloud_api_key_var.get()
-                model = self.cloud_model_var.get()
-                llm_output = TranslatorGateway.translate_cloud(base_url, api_key, model, full_prompt)
+                llm_output = TranslatorGateway.translate_cloud(
+                    runtime_config["cloud_base_url"],
+                    runtime_config["cloud_api_key"],
+                    runtime_config["cloud_model"],
+                    full_prompt,
+                    runtime_config["cloud_timeout"],
+                )
+        except Exception as exc:
+            request_error = exc
+            raise
         finally:
             try:
                 with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write("===== REQUEST META =====\n")
+                    f.write(f"provider={provider}\n")
+                    f.write(f"prompt_chars={len(full_prompt)}\n")
+                    f.write(f"reference_chars={len(self.current_reference_text)}\n")
+                    f.write(f"chunk_chars={len(chunk)}\n")
+                    if provider == "local":
+                        f.write(f"model={runtime_config['ollama_model']}\n")
+                        f.write(f"timeout={runtime_config['ollama_timeout']}\n")
+                    else:
+                        f.write(f"model={runtime_config['cloud_model']}\n")
+                        f.write(f"timeout={runtime_config['cloud_timeout']}\n")
+                    if request_error is not None:
+                        f.write("\n===== REQUEST ERROR =====\n")
+                        f.write(repr(request_error))
+                        f.write("\n")
+                    f.write("\n")
                     f.write("===== PROMPT SENT TO LLM =====\n")
                     f.write(full_prompt)
                     f.write("\n\n===== LLM RAW OUTPUT =====\n")
@@ -326,6 +509,19 @@ class TranslatorUI:
             except Exception as log_exc:
                 print(f"[Log Write Error]: {log_exc}")
         return llm_output
+
+    def _collect_runtime_config(self) -> TranslationRuntimeConfig:
+        provider = self.provider_var.get()
+        return {
+            "provider": provider,
+            "ollama_host": self.ollama_host_var.get(),
+            "ollama_model": self.ollama_model_var.get(),
+            "ollama_timeout": parse_timeout(self.ollama_timeout_var.get()) if provider == "local" else None,
+            "cloud_base_url": self.cloud_base_url_var.get(),
+            "cloud_api_key": self.cloud_api_key_var.get(),
+            "cloud_model": self.cloud_model_var.get(),
+            "cloud_timeout": parse_timeout(self.cloud_timeout_var.get()) if provider != "local" else None,
+        }
 
     def _compose_translation_input(self, chunk: str) -> str:
         sections: list[str] = []
@@ -505,27 +701,36 @@ class TranslatorUI:
     def _default_config() -> dict:
         return ConfigManager.default_config()
 
-    def _start_model_test(self) -> None:
+    def _set_model_test_buttons_state(self, state: str) -> None:
         if self.test_button is not None:
-            self.test_button.config(state="disabled")
+            self.test_button.config(state=state)
+        if self.inference_test_button is not None:
+            self.inference_test_button.config(state=state)
 
-        self.test_status_var.set("测试中，请稍候...")
-        threading.Thread(target=self._run_model_test, daemon=True).start()
+    def _start_model_test(self) -> None:
+        self._set_model_test_buttons_state("disabled")
+        self.test_status_var.set("测试连接中，请稍候...")
+        threading.Thread(target=self._run_model_test, args=(False,), daemon=True).start()
 
-    def _run_model_test(self) -> None:
+    def _start_model_inference_test(self) -> None:
+        self._set_model_test_buttons_state("disabled")
+        self.test_status_var.set("测试推理中，请稍候...")
+        threading.Thread(target=self._run_model_test, args=(True,), daemon=True).start()
+
+    def _run_model_test(self, inference: bool) -> None:
         try:
             if self.provider_var.get() == "local":
-                result = self._test_ollama_connection()
+                result = self._test_ollama_inference() if inference else self._test_ollama_connection()
             else:
-                result = self._test_cloud_connection()
+                result = self._test_cloud_inference() if inference else self._test_cloud_connection()
             self.root.after(0, self._finish_model_test, True, result)
         except Exception as exc:
-            self.root.after(0, self._finish_model_test, False, f"测试失败: {exc}")
+            label = "推理测试失败" if inference else "连接测试失败"
+            self.root.after(0, self._finish_model_test, False, f"{label}: {exc}")
 
     def _finish_model_test(self, success: bool, text: str) -> None:
         self.test_status_var.set(text)
-        if self.test_button is not None:
-            self.test_button.config(state="normal")
+        self._set_model_test_buttons_state("normal")
 
         if self.status_label_widget is not None:
             self.status_label_widget.config(foreground="#0f5132" if success else "#842029")
@@ -536,12 +741,25 @@ class TranslatorUI:
         timeout = parse_timeout(self.ollama_timeout_var.get())
         return TranslatorGateway.test_ollama_connection(host, model, timeout)
 
+    def _test_ollama_inference(self) -> str:
+        host = self.ollama_host_var.get()
+        model = self.ollama_model_var.get()
+        timeout = parse_timeout(self.ollama_timeout_var.get())
+        return TranslatorGateway.test_ollama_inference(host, model, timeout)
+
     def _test_cloud_connection(self) -> str:
         base_url = self.cloud_base_url_var.get()
         api_key = self.cloud_api_key_var.get()
         model = self.cloud_model_var.get()
         timeout = parse_timeout(self.cloud_timeout_var.get())
         return TranslatorGateway.test_cloud_connection(base_url, api_key, model, timeout)
+
+    def _test_cloud_inference(self) -> str:
+        base_url = self.cloud_base_url_var.get()
+        api_key = self.cloud_api_key_var.get()
+        model = self.cloud_model_var.get()
+        timeout = parse_timeout(self.cloud_timeout_var.get())
+        return TranslatorGateway.test_cloud_inference(base_url, api_key, model, timeout)
 
     def _on_model_window_close(self) -> None:
         self._save_config_file()
@@ -558,6 +776,7 @@ class TranslatorUI:
         self.output_text.config(state="normal")
         self.output_text.delete("1.0", "end")
         self.output_text.insert("1.0", content)
+        self.output_text.see("end")
         self.output_text.config(state="disabled")
 
     @staticmethod

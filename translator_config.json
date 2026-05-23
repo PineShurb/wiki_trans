@@ -7,8 +7,8 @@
   },
   "ollama": {
     "host": "http://127.0.0.1:11434",
-    "model": "qwen3.6:latest",
-    "timeout": "20"
+    "model": "gemma4:31b",
+    "timeout": "0"
   },
   "cloud": {
     "base_url": "https://api.openai.com/v1",

@@ -204,16 +204,22 @@ class ModelConfigDialog:
         test_frame = ttk.LabelFrame(outer, text="连接测试")
         test_frame.pack(fill="x", pady=(10, 0))
 
-        self.app.test_button = ttk.Button(test_frame, text="测试模型是否可用", command=self.app._start_model_test)
-        self.app.test_button.pack(anchor="w", padx=8, pady=(8, 4))
+        test_button_row = ttk.Frame(test_frame)
+        test_button_row.pack(anchor="w", padx=8, pady=(8, 4))
+
+        self.app.test_button = ttk.Button(test_button_row, text="测试连接与模型", command=self.app._start_model_test)
+        self.app.test_button.pack(side="left")
+        self.app.inference_test_button = ttk.Button(test_button_row, text="测试推理", command=self.app._start_model_inference_test)
+        self.app.inference_test_button.pack(side="left", padx=(8, 0))
 
         self.app.status_label_widget = ttk.Label(test_frame, textvariable=self.app.test_status_var, anchor="w", foreground="#1f2937")
         self.app.status_label_widget.pack(fill="x", padx=8, pady=(0, 8))
 
         tip = (
             "提示:\n"
-            "1. 本地 Ollama 测试会请求 /api/tags 和 /api/generate。\n"
-            "2. 云端测试会请求 /models 端点验证可用性。"
+            "1. 测试连接与模型只检查服务连通性和模型是否存在，不触发真实推理。\n"
+            "2. 测试推理会发送一次最小请求；本地 Ollama 会请求 /api/generate，云端会请求 /chat/completions。\n"
+            "3. 大模型首次加载较慢，推理测试可能需要更长超时，云端推理测试也可能产生少量 token 消耗。"
         )
         ttk.Label(test_frame, text=tip, justify="left").pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -237,8 +243,9 @@ class ModelConfigDialog:
         ttk.Label(frame, text="模型名称").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(frame, textvariable=self.app.ollama_model_var, width=46).grid(row=2, column=1, sticky="we", padx=8, pady=6)
 
-        ttk.Label(frame, text="超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Label(frame, text="请求超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(frame, textvariable=self.app.ollama_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(frame, text="留空或 0 表示不限时", foreground="#4b5563").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 6))
 
         frame.grid_columnconfigure(1, weight=1)
 
@@ -252,8 +259,9 @@ class ModelConfigDialog:
         ttk.Label(frame, text="模型名称").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(frame, textvariable=self.app.cloud_model_var, width=46).grid(row=2, column=1, sticky="we", padx=8, pady=6)
 
-        ttk.Label(frame, text="超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Label(frame, text="请求超时(秒)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(frame, textvariable=self.app.cloud_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(frame, text="留空或 0 表示不限时", foreground="#4b5563").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 6))
 
         frame.grid_columnconfigure(1, weight=1)
 
