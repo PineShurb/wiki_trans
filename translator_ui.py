@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from config_manager import ConfigManager
+from filter_translation_csv import extract_tokens, row_matches
 from text_utils import parse_timeout
 from translator_gateway import TranslatorGateway
 from ui_pages import (
@@ -33,6 +34,9 @@ class TranslationRuntimeConfig(TypedDict):
 
 
 class TranslatorUI:
+    TERMINOLOGY_MIN_WORD_LENGTH = 2
+    TERMINOLOGY_KEEP_STOPWORDS = False
+
     def _get_log_file(self) -> str:
         log_dir = os.path.join(os.path.dirname(__file__), "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -99,6 +103,7 @@ class TranslatorUI:
         self.current_prompt = ""
         self.current_terminology_path = ""
         self.current_terminology_entries: list[dict[str, str]] = []
+        self.filtered_terminology_entries: list[dict[str, str]] = []
         self.current_reference_text = ""
         self.current_runtime_config: TranslationRuntimeConfig | None = None
         self.translation_started_at: float | None = None
@@ -291,11 +296,17 @@ class TranslatorUI:
         self.current_prompt = str(config_data.get("prompt", "")).strip()
         self.current_terminology_path = str(config_data.get("terminology_path", "")).strip()
         self.current_terminology_entries = []
+        self.filtered_terminology_entries = []
         if self.current_terminology_path:
             try:
                 self.current_terminology_entries = self._load_terminology_entries(self.current_terminology_path)
+                self.filtered_terminology_entries = self._filter_terminology_entries_by_text(
+                    raw_text,
+                    self.current_terminology_entries,
+                )
             except FileNotFoundError:
                 self.current_terminology_entries = []
+                self.filtered_terminology_entries = []
             except (OSError, ValueError) as exc:
                 messagebox.showwarning("提示", f"术语表加载失败: {exc}")
                 return
@@ -554,13 +565,28 @@ class TranslatorUI:
         return "\n\n".join(sections)
 
     def _build_terminology_block(self, chunk: str) -> str:
-        if not self.current_terminology_entries:
+        base_entries = self.filtered_terminology_entries or self.current_terminology_entries
+        if not base_entries:
             return ""
 
-        chunk_text = chunk.casefold()
-        matched_entries = [
-            entry for entry in self.current_terminology_entries if entry["source"].casefold() in chunk_text
-        ]
+        source_tokens = extract_tokens(
+            chunk,
+            min_word_length=self.TERMINOLOGY_MIN_WORD_LENGTH,
+            keep_stopwords=self.TERMINOLOGY_KEEP_STOPWORDS,
+        )
+        if not source_tokens:
+            return ""
+
+        matched_entries = []
+        for entry in base_entries:
+            row = [entry["source"], entry["target"], entry["note"], ""]
+            if row_matches(
+                row,
+                source_tokens,
+                min_word_length=self.TERMINOLOGY_MIN_WORD_LENGTH,
+                keep_stopwords=self.TERMINOLOGY_KEEP_STOPWORDS,
+            ):
+                matched_entries.append(entry)
         if not matched_entries:
             return ""
 
@@ -572,6 +598,34 @@ class TranslatorUI:
                 item += f" ({entry['note']})"
             lines.append(item)
         return "\n".join(lines)
+
+    def _filter_terminology_entries_by_text(
+        self,
+        source_text: str,
+        entries: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        if not source_text or not entries:
+            return []
+
+        source_tokens = extract_tokens(
+            source_text,
+            min_word_length=self.TERMINOLOGY_MIN_WORD_LENGTH,
+            keep_stopwords=self.TERMINOLOGY_KEEP_STOPWORDS,
+        )
+        if not source_tokens:
+            return []
+
+        matched_entries: list[dict[str, str]] = []
+        for entry in entries:
+            row = [entry["source"], entry["target"], entry["note"], ""]
+            if row_matches(
+                row,
+                source_tokens,
+                min_word_length=self.TERMINOLOGY_MIN_WORD_LENGTH,
+                keep_stopwords=self.TERMINOLOGY_KEEP_STOPWORDS,
+            ):
+                matched_entries.append(entry)
+        return matched_entries
 
     def _load_terminology_entries(self, terminology_path: str) -> list[dict[str, str]]:
         normalized_path = terminology_path.strip()
@@ -585,27 +639,69 @@ class TranslatorUI:
             raise ValueError(f"术语表路径不是文件: {glossary_path}")
 
         entries: list[dict[str, str]] = []
+        delimiter = self._detect_terminology_delimiter(glossary_path)
         with glossary_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.reader(handle, delimiter="\t")
+            reader = csv.reader(handle, delimiter=delimiter)
             for line_number, row in enumerate(reader, start=1):
                 normalized_row = [column.strip() for column in row]
                 if not normalized_row or not any(normalized_row):
                     continue
                 if normalized_row[0].startswith("#"):
                     continue
+                if self._is_terminology_description_row(normalized_row):
+                    continue
                 if self._is_terminology_header(normalized_row):
                     continue
-                if len(normalized_row) < 2 or not normalized_row[0] or not normalized_row[1]:
+                parsed_entry = self._parse_terminology_row(normalized_row)
+                if parsed_entry is None:
                     raise ValueError(
-                        f"{glossary_path.name} 第 {line_number} 行格式无效，应为 source_term[TAB]target_term[TAB]note"
+                        f"{glossary_path.name} 第 {line_number} 行格式无效，应为 2/3 列术语表或 4 列 RimWorld 术语 CSV"
                     )
 
-                entries.append({
-                    "source": normalized_row[0],
-                    "target": normalized_row[1],
-                    "note": normalized_row[2] if len(normalized_row) > 2 else "",
-                })
+                entries.append(parsed_entry)
         return entries
+
+    def _detect_terminology_delimiter(self, glossary_path: Path) -> str:
+        if glossary_path.suffix.casefold() == ".tsv":
+            return "\t"
+
+        try:
+            with glossary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                sample = handle.read(8192)
+        except OSError:
+            sample = ""
+
+        if sample:
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters="\t,;")
+                return dialect.delimiter
+            except csv.Error:
+                pass
+
+        return ","
+
+    @staticmethod
+    def _parse_terminology_row(row: list[str]) -> dict[str, str] | None:
+        # 兼容两类格式：
+        # 1) source,target[,note]
+        # 2) label,source,target,note (RimWorld CSV)
+        if len(row) >= 4:
+            source, target = row[1], row[2]
+            note = row[3]
+        elif len(row) >= 2:
+            source, target = row[0], row[1]
+            note = row[2] if len(row) > 2 else ""
+        else:
+            return None
+
+        if not source or not target:
+            return None
+
+        return {
+            "source": source,
+            "target": target,
+            "note": note,
+        }
 
     def _resolve_terminology_path(self, terminology_path: str) -> Path:
         candidate = Path(terminology_path).expanduser()
@@ -621,7 +717,19 @@ class TranslatorUI:
         second_column = row[1].casefold()
         source_markers = {"source", "source_term", "term", "source phrase"}
         target_markers = {"target", "target_term", "translation", "target phrase"}
-        return first_column in source_markers and second_column in target_markers
+        zh_source_markers = {"英文", "英文原文", "原文", "源术语"}
+        zh_target_markers = {"中文", "中文翻译", "译文", "目标术语"}
+        is_standard_header = first_column in source_markers and second_column in target_markers
+        is_zh_header = first_column in zh_source_markers and second_column in zh_target_markers
+        is_rimworld_header = first_column == "label" and second_column in zh_source_markers
+        return is_standard_header or is_zh_header or is_rimworld_header
+
+    @staticmethod
+    def _is_terminology_description_row(row: list[str]) -> bool:
+        if len(row) != 1:
+            return False
+        first = row[0].strip().casefold()
+        return first.startswith("说明") or first.startswith("note")
 
     def _open_model_config_window(self) -> None:
         ModelConfigDialog(self).open()
