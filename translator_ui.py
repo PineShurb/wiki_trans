@@ -2,6 +2,7 @@ import csv
 import datetime
 from difflib import SequenceMatcher
 import os
+import subprocess
 import time
 import tkinter as tk
 from collections.abc import Callable
@@ -110,6 +111,10 @@ class TranslatorUI:
         self.translation_status_job: str | None = None
         self.translation_status_tick = 0
         self.translation_error_count = 0
+        self.gpu_usage_text = ""
+        self.gpu_usage_supported = True
+        self.gpu_usage_updated_at = 0.0
+        self.gpu_usage_fetching = False
         self.diff_mode_enabled = False
 
         self.provider_var = tk.StringVar(value="local")
@@ -327,6 +332,10 @@ class TranslatorUI:
         self.translation_started_at = time.monotonic()
         self.translation_status_tick = 0
         self.translation_error_count = 0
+        self.gpu_usage_text = ""
+        self.gpu_usage_supported = True
+        self.gpu_usage_updated_at = 0.0
+        self.gpu_usage_fetching = False
         self.progress_var.set(0)
         self._set_output_text(self._build_waiting_output_hint())
         self._start_translation_feedback()
@@ -415,6 +424,89 @@ class TranslatorUI:
         parts.append("长文本或首次加载模型时，等待时间可能较长。")
         return " ".join(parts)
 
+    @staticmethod
+    def _parse_gpu_memory_query(output: str) -> tuple[int, int] | None:
+        gpu_memory_pairs: list[tuple[int, int]] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            parts = [part.strip() for part in line.split(",", maxsplit=1)]
+            if len(parts) != 2:
+                continue
+
+            try:
+                used_mib = int(parts[0])
+                total_mib = int(parts[1])
+            except ValueError:
+                continue
+
+            if used_mib < 0 or total_mib <= 0:
+                continue
+
+            gpu_memory_pairs.append((used_mib, total_mib))
+
+        if not gpu_memory_pairs:
+            return None
+
+        used_total = sum(used_mib for used_mib, _ in gpu_memory_pairs)
+        total_total = sum(total_mib for _, total_mib in gpu_memory_pairs)
+        return used_total, total_total
+
+    @staticmethod
+    def _format_gpu_memory_pair(used_mib: int, total_mib: int) -> str:
+        return f"{used_mib}/{total_mib} MiB"
+
+    def _read_gpu_usage_text(self) -> str | None:
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=0.5,
+            )
+        except (FileNotFoundError, OSError, subprocess.CalledProcessError):
+            return None
+        except subprocess.TimeoutExpired:
+            return ""
+
+        gpu_memory = self._parse_gpu_memory_query(completed.stdout)
+        if gpu_memory is None:
+            return ""
+
+        used_mib, total_mib = gpu_memory
+        return self._format_gpu_memory_pair(used_mib, total_mib)
+
+    def _refresh_gpu_usage_worker(self) -> None:
+        gpu_usage_text = self._read_gpu_usage_text()
+        self.root.after(0, self._apply_gpu_usage_text, gpu_usage_text)
+
+    def _apply_gpu_usage_text(self, gpu_usage_text: str | None) -> None:
+        if gpu_usage_text is None:
+            self.gpu_usage_supported = False
+            self.gpu_usage_text = ""
+        else:
+            self.gpu_usage_text = gpu_usage_text
+        self.gpu_usage_updated_at = time.monotonic()
+        self.gpu_usage_fetching = False
+
+    def _queue_gpu_usage_refresh(self, now: float) -> None:
+        if not self.gpu_usage_supported:
+            return
+        if self.gpu_usage_fetching:
+            return
+        if (now - self.gpu_usage_updated_at) < 1.0:
+            return
+
+        self.gpu_usage_fetching = True
+        threading.Thread(target=self._refresh_gpu_usage_worker, daemon=True).start()
+
     def _start_translation_feedback(self) -> None:
         self._stop_translation_feedback()
         self.progress.configure(mode="indeterminate")
@@ -433,10 +525,21 @@ class TranslatorUI:
             return
 
         chunk_label = f"{min(self.current_index + 1, total_chunks)}/{total_chunks}"
-        elapsed = 0.0 if self.translation_started_at is None else time.monotonic() - self.translation_started_at
+        now = time.monotonic()
+        elapsed = 0.0 if self.translation_started_at is None else now - self.translation_started_at
         dots = "." * ((self.translation_status_tick % 3) + 1)
         phase = "等待模型响应" if not self.active_chunk_text else "正在接收输出"
-        self.status_var.set(f"翻译中{dots} 第 {chunk_label} 段，{phase}，已运行 {elapsed:.0f} 秒")
+        self._queue_gpu_usage_refresh(now)
+
+        status_parts = [
+            f"翻译中{dots} 第 {chunk_label} 段",
+            phase,
+            f"已运行 {elapsed:.0f} 秒",
+        ]
+        if self.gpu_usage_text:
+            status_parts.append(f"GPU {self.gpu_usage_text}")
+
+        self.status_var.set("，".join(status_parts))
         self.translation_status_tick += 1
         self.translation_status_job = self.root.after(700, self._schedule_translation_feedback)
 
@@ -484,6 +587,24 @@ class TranslatorUI:
         llm_output = ""
         request_error: Exception | None = None
         try:
+            with open(self._log_file, "a", encoding="utf-8") as f:
+                f.write("===== REQUEST META =====\n")
+                f.write(f"provider={provider}\n")
+                f.write(f"prompt_chars={len(full_prompt)}\n")
+                f.write(f"reference_chars={len(self.current_reference_text)}\n")
+                f.write(f"chunk_chars={len(chunk)}\n")
+                if provider == "local":
+                    f.write(f"model={runtime_config['ollama_model']}\n")
+                    f.write(f"timeout={runtime_config['ollama_timeout']}\n")
+                else:
+                    f.write(f"model={runtime_config['cloud_model']}\n")
+                    f.write(f"timeout={runtime_config['cloud_timeout']}\n")
+                f.write("\n===== PROMPT SENT TO LLM =====\n")
+                f.write(full_prompt)
+                f.write("\n\n")
+        except Exception as log_exc:
+            print(f"[Log Write Error]: {log_exc}")
+        try:
             if provider == "local":
                 if on_chunk is None:
                     llm_output = TranslatorGateway.translate_ollama(
@@ -514,25 +635,11 @@ class TranslatorUI:
         finally:
             try:
                 with open(self._log_file, "a", encoding="utf-8") as f:
-                    f.write("===== REQUEST META =====\n")
-                    f.write(f"provider={provider}\n")
-                    f.write(f"prompt_chars={len(full_prompt)}\n")
-                    f.write(f"reference_chars={len(self.current_reference_text)}\n")
-                    f.write(f"chunk_chars={len(chunk)}\n")
-                    if provider == "local":
-                        f.write(f"model={runtime_config['ollama_model']}\n")
-                        f.write(f"timeout={runtime_config['ollama_timeout']}\n")
-                    else:
-                        f.write(f"model={runtime_config['cloud_model']}\n")
-                        f.write(f"timeout={runtime_config['cloud_timeout']}\n")
                     if request_error is not None:
-                        f.write("\n===== REQUEST ERROR =====\n")
+                        f.write("===== REQUEST ERROR =====\n")
                         f.write(repr(request_error))
-                        f.write("\n")
-                    f.write("\n")
-                    f.write("===== PROMPT SENT TO LLM =====\n")
-                    f.write(full_prompt)
-                    f.write("\n\n===== LLM RAW OUTPUT =====\n")
+                        f.write("\n\n")
+                    f.write("===== LLM RAW OUTPUT =====\n")
                     f.write(str(llm_output))
                     f.write("\n\n===========================\n")
             except Exception as log_exc:
